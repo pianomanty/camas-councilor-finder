@@ -1,153 +1,155 @@
+import json
+from pathlib import Path
+
 import geopandas as gpd
 import pandas as pd
-from matplotlib import pyplot as plt
-from pyproj import CRS
-from os import getcwd
-from pathlib import Path
-from geopy.geocoders import Nominatim
-from geopy.extra.rate_limiter import RateLimiter
 import usaddress
-from os import getcwd
+from geopy.extra.rate_limiter import RateLimiter
+from geopy.geocoders import Nominatim
+from probableparsing import RepeatedLabelError
 
-# Address cleaning
-def clean_us_address(raw_address):
-    """
-    Parses messy US addresses, strips unit/apartment numbers (which throw off geocoders),
-    and reconstructs a standardized string: 'Street Number Street Name, City, State Zip'
-    """
+DATA_DIR = Path(__file__).resolve().parent / "Data"
+DEFAULT_WARD_GEOJSON = DATA_DIR / "ward_boundaries.geojson"
+DEFAULT_COUNCILORS_JSON = DATA_DIR / "councilors.json"
+
+
+def clean_us_address(raw_address: str | None) -> str | None:
+    """Parse a US address and strip unit/apartment numbers for street-level geocoding."""
     if not isinstance(raw_address, str) or not raw_address.strip():
         return None
-    
+
     try:
-        # Tag the components using Conditional Random Fields
-        tagged_dict, address_type = usaddress.tag(raw_address)
-    except usaddress.RepeatedLabelError:
-        # Fallback if the address contains repeating ambiguous words
+        tagged_dict, _ = usaddress.tag(raw_address)
+    except RepeatedLabelError:
         return raw_address.strip()
     
-    # Extract key parts safely
-    num = tagged_dict.get('AddressNumber', '')
-    predir = tagged_dict.get('StreetNamePreDirectional', '')
-    street = tagged_dict.get('StreetName', '')
-    postdir = tagged_dict.get('StreetNamePostDirectional', '')
-    st_type = tagged_dict.get('StreetNamePostType', '')
-    city = tagged_dict.get('PlaceName', '')
-    state = tagged_dict.get('StateName', '')
-    zip_code = tagged_dict.get('ZipCode', '')
-    
-    # Assemble street line (skipping Apt/Suite numbers as geocoders match better at street level)
-    street_parts = [num, predir, street, st_type, postdir]
-    street_line = " ".join([p for p in street_parts if p]).strip()
-    
-    # Assemble standard format
+    street_parts = [
+        tagged_dict.get("AddressNumber", ""),
+        tagged_dict.get("StreetNamePreDirectional", ""),
+        tagged_dict.get("StreetName", ""),
+        tagged_dict.get("StreetNamePostType", ""),
+        tagged_dict.get("StreetNamePostDirectional", ""),
+    ]
+    street_line = " ".join(part for part in street_parts if part).strip()
+
+    city = tagged_dict.get("PlaceName", "")
+    state = tagged_dict.get("StateName", "")
+    zip_code = tagged_dict.get("ZipCode", "")
     city_state_zip = f"{city}, {state} {zip_code}".strip(", ")
-    
+
     if street_line and city_state_zip:
         return f"{street_line}, {city_state_zip}"
-    elif street_line:
+    if street_line:
         return street_line
     return raw_address.strip()
 
-def geolocate_address(addresses):
-    df = pd.DataFrame({"raw_input": addresses})
-    df["clean_address"] = df["raw_input"].apply(clean_us_address)
 
-    # Initialize free OpenStreetMap Nominatim geocoder
-    # Note: Always pass a unique `user_agent` string per Nominatim usage guidelines
-    geolocator = Nominatim(user_agent="my_us_address_cleaner_app")
+def build_geocoder(user_agent: str = "camas_ward_lookup_cli"):
+    """Initialize a rate-limited Nominatim geocoder (1 req/sec per usage policy)."""
+    geolocator = Nominatim(user_agent=user_agent)
+    return RateLimiter(geolocator.geocode, min_delay_seconds=1.0)
 
-    # Wrap with RateLimiter to adhere to Nominatim's 1-request-per-second rule
-    geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.0)
 
-    # Perform geocoding
-    df["location"] = df["clean_address"].apply(geocode)
+def geocode_address(raw_address: str, geocode_fn) -> gpd.GeoDataFrame:
+    """Clean and geocode a single address into a single-row GeoDataFrame (EPSG:4326)."""
+    cleaned = clean_us_address(raw_address)
+    if not cleaned:
+        raise ValueError("Please enter a valid non-empty address.")
 
-    # Extract coordinates and full returned address
-    df["latitude"] = df["location"].apply(lambda loc: loc.latitude if loc else None)
-    df["longitude"] = df["location"].apply(lambda loc: loc.longitude if loc else None)
+    location = geocode_fn(cleaned)
+    if location is None:
+        raise ValueError(f"Could not geocode address: '{cleaned}'")
 
-    # -------------------------------------------------------------
-    # 4. Convert to GeoPandas DataFrame
-    # -------------------------------------------------------------
-    gdf_addresses = gpd.GeoDataFrame(
-        df, 
-        geometry=gpd.points_from_xy(df.longitude, df.latitude), 
-        crs="EPSG:4326"
+    df = pd.DataFrame(
+        [
+            {
+                "raw_input": raw_address.strip(),
+                "clean_address": cleaned,
+                "matched_address": location.address,
+                "latitude": location.latitude,
+                "longitude": location.longitude,
+            }
+        ]
     )
-    return gdf_addresses
+    return gpd.GeoDataFrame(
+        df,
+        geometry=gpd.points_from_xy(df["longitude"], df["latitude"]),
+        crs="EPSG:4326",
+    )
 
-def load_ward_data():
-    # Define data path, import ward data
-    data_path = Path('/Users/tyler/Documents/Repositories/GIS_Analysis/Camas Ward Info/Data/ward_boundaries.geojson')
-    ward_data = gpd.read_file(data_path)
-    ward_data = ward_data.dropna() # investigation showed the NaN row was some islands in Lacamas lake lol
-    crs_camas = ward_data.crs
 
-    # Create categorical data for ward names
-    ward_data['Ward_Cat'] = ward_data['Ward'].astype(int).astype(str)
-    ward_data['Ward_Cat'] = 'Ward ' + ward_data['Ward_Cat']  # Optional: Label them nicely ("Ward 1", etc.)
+def load_councilor_roster(
+    councilors_path: Path = DEFAULT_COUNCILORS_JSON,
+) -> tuple[dict[int, list[str]], str]:
+    """Load ward and at-large councilor mappings from JSON."""
+    with councilors_path.open("r", encoding="utf-8") as f:
+        roster = json.load(f)
 
-    # Make councilors dictionary
     ward_councilors = {
-        1: ["Marilyn Boerke", "John Nohr"],
-        2: ["Martin Elzingre", "Tim Hein"],
-        3: ["Jennifer Senescu", "Mahsa Eshghi"],
+        int(ward_num): names for ward_num, names in roster["wards"].items()
+    }
+    at_large_councilor = roster["at_large"]
+    return ward_councilors, at_large_councilor
+
+
+def load_ward_data(
+    geojson_path: Path = DEFAULT_WARD_GEOJSON,
+    councilors_path: Path = DEFAULT_COUNCILORS_JSON,
+) -> gpd.GeoDataFrame:
+    """Load Camas ward polygons and attach ward and at-large councilor info."""
+    ward_councilors, at_large_councilor = load_councilor_roster(councilors_path)
+
+    ward_data = gpd.read_file(geojson_path)
+    ward_data = ward_data.dropna(subset=["Ward", "geometry"]).copy()
+
+    ward_nums = ward_data["Ward"].astype(int)
+    councilor_labels = {
+        ward: " & ".join(names) for ward, names in ward_councilors.items()
     }
 
-    # Add councilors to dataframe
-    ward_data['Councilors'] = ward_data['Ward'].map(ward_councilors).apply(
-        lambda names: " & ".join(names) if isinstance(names, list) else names
-    )
-
-    # Add the At-Large representative separate column
-    at_large_member = "John Svilarich"
-    ward_data['At_Large'] = at_large_member
+    ward_data["Ward_Cat"] = "Ward " + ward_nums.astype(str)
+    ward_data["Councilors"] = ward_nums.map(councilor_labels)
+    ward_data["At_Large"] = at_large_councilor
 
     return ward_data
 
-def find_wards(address_df,ward_data):
-    # 1. Ensure both DataFrames use the exact same CRS
-    if address_df.crs != ward_data.crs:
-        address_df = address_df.to_crs(ward_data.crs)
 
-    # 2. Spatial join with gdf_addresses on the left (keeps all addresses)
-    ward_selection = gpd.sjoin(
-        address_df,                                    # Left side: keeps ALL addresses
-        ward_data[['Ward_Cat', 'Councilors', 'At_Large', 'geometry']], # Right side: ward columns & geometry to bring over
-        how='left',                                       # Keep every address row even if it misses a ward
-        predicate='within'                              # Check if the address point lies within the ward polygon
-    )
+def find_ward(address_gdf: gpd.GeoDataFrame, ward_data: gpd.GeoDataFrame) -> pd.Series:
+    """Return the matching ward row for a point GeoDataFrame, or raise ValueError."""
+    if address_gdf.crs != ward_data.crs and ward_data.crs is not None:
+        address_gdf = address_gdf.to_crs(ward_data.crs)
 
-    # Optional: Clean up duplicate/extra index columns created during the join
-    ward_selection = ward_selection.drop(columns=['index_right'], errors='ignore')
+    joined = gpd.sjoin(
+        address_gdf,
+        ward_data[["Ward_Cat", "Councilors", "At_Large", "geometry"]],
+        how="left",
+        predicate="intersects",
+    ).drop(columns=["index_right"], errors="ignore")
 
-    #Raise error if nothing found
-    has_misses = ward_selection["Ward_Cat"].isna().any()
-    if has_misses:
-        raise ValueError('No match found')
-    return ward_selection
+    match = joined.iloc[0]
+    if pd.isna(match["Ward_Cat"]):
+        raise ValueError("Address does not fall within a Camas city ward.")
 
-if __name__ == '__main__':
-    print(getcwd())
-    # Get user address, clean it, geolocate it
-    user_address = input('Please enter your address: ')
-    cleaned_address = clean_us_address(user_address)
-    address_geolocated_df = geolocate_address([cleaned_address])
+    return match
 
-    # Load data
-    ward_data = load_ward_data()
+
+def main() -> None:
+    user_address = input("Please enter your address: ")
+    geocode_fn = build_geocoder()
 
     try:
-        # Find ward info
-        result = find_wards(address_geolocated_df,ward_data)
-        # Extract ward info and councilors
-        ward_info = result["Ward_Cat"].iloc[0]
-        ward_councilors = result["Councilors"].iloc[0]
-        at_large = result["At_Large"].iloc[0]
+        address_gdf = geocode_address(user_address, geocode_fn)
+        ward_data = load_ward_data()
+        match = find_ward(address_gdf, ward_data)
+    except (ValueError, FileNotFoundError, KeyError, json.JSONDecodeError) as exc:
+        print(f"Error: {exc}")
+        return
 
-        print(f'You live in {ward_info}')
-        print(f'Your councilors are {ward_councilors}')
-        print(f'You are also represented by at-large councilor {at_large}')
-    except ValueError as e:
-        print(e)
+    print(f"Matched address: {match['matched_address']}")
+    print(f"You live in {match['Ward_Cat']}")
+    print(f"Your councilors are {match['Councilors']}")
+    print(f"You are also represented by at-large councilor {match['At_Large']}")
 
+
+if __name__ == "__main__":
+    main()
