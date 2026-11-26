@@ -1,0 +1,9 @@
+# Geocode cache (created on first lookup, per-Pi)
+Data/geocode_cache.json
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+uv.lock
