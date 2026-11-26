@@ -1,5 +1,7 @@
 import json
+from functools import partial
 from pathlib import Path
+from typing import Any
 
 import geopandas as gpd
 import pandas as pd
@@ -11,18 +13,27 @@ from probableparsing import RepeatedLabelError
 DATA_DIR = Path(__file__).resolve().parent / "Data"
 DEFAULT_WARD_GEOJSON = DATA_DIR / "ward_boundaries.geojson"
 DEFAULT_COUNCILORS_JSON = DATA_DIR / "councilors.json"
+DEFAULT_CACHE_JSON = DATA_DIR / "geocode_cache.json"
+
+# Bounding box around Camas, WA as (latitude, longitude) corners for GeoPy
+CAMAS_VIEWBOX = [(45.56, -122.48), (45.66, -122.34)]
 
 
-def clean_us_address(raw_address: str | None) -> str | None:
-    """Parse a US address and strip unit/apartment numbers for street-level geocoding."""
+def clean_us_address(
+    raw_address: str | None,
+    default_city: str = "Camas",
+    default_state: str = "WA",
+) -> str | None:
+    """Parse a US address, strip unit numbers, and default missing city/state to Camas, WA."""
     if not isinstance(raw_address, str) or not raw_address.strip():
         return None
 
     try:
         tagged_dict, _ = usaddress.tag(raw_address)
     except RepeatedLabelError:
-        return raw_address.strip()
-    
+        text = raw_address.strip()
+        return text if "," in text else f"{text}, {default_city}, {default_state}"
+
     street_parts = [
         tagged_dict.get("AddressNumber", ""),
         tagged_dict.get("StreetNamePreDirectional", ""),
@@ -32,42 +43,93 @@ def clean_us_address(raw_address: str | None) -> str | None:
     ]
     street_line = " ".join(part for part in street_parts if part).strip()
 
-    city = tagged_dict.get("PlaceName", "")
-    state = tagged_dict.get("StateName", "")
+    city = tagged_dict.get("PlaceName") or default_city
+    state = tagged_dict.get("StateName") or default_state
     zip_code = tagged_dict.get("ZipCode", "")
-    city_state_zip = f"{city}, {state} {zip_code}".strip(", ")
+    city_state_zip = f"{city}, {state} {zip_code}".strip()
 
-    if street_line and city_state_zip:
-        return f"{street_line}, {city_state_zip}"
     if street_line:
-        return street_line
+        return f"{street_line}, {city_state_zip}"
     return raw_address.strip()
 
 
-def build_geocoder(user_agent: str = "camas_ward_lookup_cli"):
-    """Initialize a rate-limited Nominatim geocoder (1 req/sec per usage policy)."""
+def build_geocoder(
+    user_agent: str = "camas_ward_lookup_cli/1.0",
+    viewbox: list[tuple[float, float]] = CAMAS_VIEWBOX,
+):
+    """Initialize a rate-limited Nominatim geocoder biased toward Camas, WA."""
     geolocator = Nominatim(user_agent=user_agent)
-    return RateLimiter(geolocator.geocode, min_delay_seconds=1.0)
+    biased_geocode = partial(
+        geolocator.geocode,
+        viewbox=viewbox,
+        bounded=False,
+        country_codes="us",
+    )
+    return RateLimiter(biased_geocode, min_delay_seconds=1.0)
 
 
-def geocode_address(raw_address: str, geocode_fn) -> gpd.GeoDataFrame:
-    """Clean and geocode a single address into a single-row GeoDataFrame (EPSG:4326)."""
+def load_geocode_cache(cache_path: Path = DEFAULT_CACHE_JSON) -> dict[str, dict[str, Any]]:
+    """Load previously geocoded addresses from a local JSON cache."""
+    if not cache_path.exists():
+        return {}
+    try:
+        with cache_path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_geocode_cache(
+    cache: dict[str, dict[str, Any]],
+    cache_path: Path = DEFAULT_CACHE_JSON,
+) -> None:
+    """Persist geocoded address results to disk."""
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with cache_path.open("w", encoding="utf-8") as f:
+        json.dump(cache, f, indent=2)
+
+
+def geocode_address(
+    raw_address: str,
+    geocode_fn,
+    cache_path: Path = DEFAULT_CACHE_JSON,
+) -> gpd.GeoDataFrame:
+    """Clean and geocode a single address (using local cache if available)."""
     cleaned = clean_us_address(raw_address)
     if not cleaned:
         raise ValueError("Please enter a valid non-empty address.")
 
-    location = geocode_fn(cleaned)
-    if location is None:
-        raise ValueError(f"Could not geocode address: '{cleaned}'")
+    cache = load_geocode_cache(cache_path)
+    cached_hit = cache.get(cleaned)
+
+    if cached_hit is not None:
+        matched_address = cached_hit["matched_address"]
+        latitude = cached_hit["latitude"]
+        longitude = cached_hit["longitude"]
+    else:
+        location = geocode_fn(cleaned)
+        if location is None:
+            raise ValueError(f"Could not geocode address: '{cleaned}'")
+
+        matched_address = location.address
+        latitude = location.latitude
+        longitude = location.longitude
+
+        cache[cleaned] = {
+            "matched_address": matched_address,
+            "latitude": latitude,
+            "longitude": longitude,
+        }
+        save_geocode_cache(cache, cache_path)
 
     df = pd.DataFrame(
         [
             {
                 "raw_input": raw_address.strip(),
                 "clean_address": cleaned,
-                "matched_address": location.address,
-                "latitude": location.latitude,
-                "longitude": location.longitude,
+                "matched_address": matched_address,
+                "latitude": latitude,
+                "longitude": longitude,
             }
         ]
     )
@@ -114,23 +176,31 @@ def load_ward_data(
     return ward_data
 
 
-def find_ward(address_gdf: gpd.GeoDataFrame, ward_data: gpd.GeoDataFrame) -> pd.Series:
-    """Return the matching ward row for a point GeoDataFrame, or raise ValueError."""
-    if address_gdf.crs != ward_data.crs and ward_data.crs is not None:
+def find_wards(
+    address_gdf: gpd.GeoDataFrame,
+    ward_data: gpd.GeoDataFrame,
+) -> gpd.GeoDataFrame:
+    """Return matching ward row(s) for a point GeoDataFrame, or raise ValueError."""
+    if ward_data.crs is None:
+        raise ValueError("Ward boundary data is missing a coordinate reference system (CRS).")
+
+    if address_gdf.crs != ward_data.crs:
         address_gdf = address_gdf.to_crs(ward_data.crs)
 
     joined = gpd.sjoin(
         address_gdf,
         ward_data[["Ward_Cat", "Councilors", "At_Large", "geometry"]],
-        how="left",
+        how="inner",
         predicate="intersects",
     ).drop(columns=["index_right"], errors="ignore")
 
-    match = joined.iloc[0]
-    if pd.isna(match["Ward_Cat"]):
-        raise ValueError("Address does not fall within a Camas city ward.")
+    if joined.empty:
+        raise ValueError(
+            "This address is outside Camas city limits (for example, in unincorporated "
+            "Clark County) and is not represented by a Camas city ward."
+        )
 
-    return match
+    return joined
 
 
 def main() -> None:
@@ -140,15 +210,29 @@ def main() -> None:
     try:
         address_gdf = geocode_address(user_address, geocode_fn)
         ward_data = load_ward_data()
-        match = find_ward(address_gdf, ward_data)
+        matches = find_wards(address_gdf, ward_data)
     except (ValueError, FileNotFoundError, KeyError, json.JSONDecodeError) as exc:
         print(f"Error: {exc}")
         return
 
-    print(f"Matched address: {match['matched_address']}")
-    print(f"You live in {match['Ward_Cat']}")
-    print(f"Your councilors are {match['Councilors']}")
-    print(f"You are also represented by at-large councilor {match['At_Large']}")
+    matched_address = matches["matched_address"].iloc[0]
+    at_large = matches["At_Large"].iloc[0]
+
+    print(f"Matched address: {matched_address}")
+
+    if len(matches) > 1:
+        print(
+            "Note: This geocoded point sits directly on a ward boundary (street-level "
+            "geocoding can sometimes place a pin on a dividing street):"
+        )
+        for _, row in matches.iterrows():
+            print(f"  - {row['Ward_Cat']}: {row['Councilors']}")
+    else:
+        row = matches.iloc[0]
+        print(f"You live in {row['Ward_Cat']}")
+        print(f"Your councilors are {row['Councilors']}")
+
+    print(f"You are also represented by at-large councilor {at_large}")
 
 
 if __name__ == "__main__":
