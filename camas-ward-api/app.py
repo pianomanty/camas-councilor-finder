@@ -13,7 +13,7 @@ app = Flask(__name__)
 # Load ward polygons & councilors once when the server starts
 WARD_DATA = load_ward_data()
 GEOCODE_FN = build_geocoder(
-    user_agent="camas_ward_lookup_web/1.0 (contact@yourdomain.com)"
+    user_agent="camas_ward_lookup_web/1.0 (strongtownscamas@gmail.com)"
 )
 GEOCODE_LOCK = Lock()
 
