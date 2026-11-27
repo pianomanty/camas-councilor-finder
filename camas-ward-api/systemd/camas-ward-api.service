@@ -4,10 +4,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=pi
-Group=pi
-WorkingDirectory=/home/pi/camas-ward-api
-ExecStart=/home/pi/camas-ward-api/.venv/bin/python app.py
+User=strongtowns
+Group=strongtowns
+WorkingDirectory=/home/strongtowns/camas-councilor-finder/camas-ward-api
+ExecStart=/home/strongtowns/camas-councilor-finder/.venv/bin/python app.py
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
